@@ -4,7 +4,6 @@
 package containerd
 
 import (
-	"context"
 	"os"
 
 	"github.com/containerd/containerd"
@@ -20,10 +19,13 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
-	"k8s.io/kubernetes/pkg/kubelet/util"
+	"k8s.io/cri-client/pkg/util"
 )
 
-const socketPrefix = "unix://"
+const (
+	socketPrefix = "unix://"
+	runtimesPath = "/usr/local/nvidia/toolkit:/opt/kwasm/bin"
+)
 
 func getContainerdArgs(cfg *config.Node) []string {
 	args := []string{
@@ -36,9 +38,9 @@ func getContainerdArgs(cfg *config.Node) []string {
 	return args
 }
 
-// setupContainerdConfig generates the containerd.toml, using a template combined with various
+// SetupContainerdConfig generates the containerd.toml, using a template combined with various
 // runtime configurations and registry mirror settings provided by the administrator.
-func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
+func SetupContainerdConfig(cfg *config.Node) error {
 	isRunningInUserNS := userns.RunningInUserNS()
 	_, _, controllers := cgroups.CheckCgroups()
 	// "/sys/fs/cgroup" is namespaced
@@ -53,7 +55,12 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 		cfg.AgentConfig.Systemd = !isRunningInUserNS && controllers["cpuset"] && os.Getenv("INVOCATION_ID") != ""
 	}
 
-	extraRuntimes := findContainerRuntimes(os.DirFS(string(os.PathSeparator)))
+	// set the path to include the default runtimes and remove the aditional path entries
+	// that we added after finding the runtimes
+	originalPath := os.Getenv("PATH")
+	os.Setenv("PATH", runtimesPath+string(os.PathListSeparator)+originalPath)
+	extraRuntimes := findContainerRuntimes()
+	os.Setenv("PATH", originalPath)
 
 	// Verifies if the DefaultRuntime can be found
 	if _, ok := extraRuntimes[cfg.DefaultRuntime]; !ok && cfg.DefaultRuntime != "" {
@@ -66,6 +73,7 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 		SystemdCgroup:         cfg.AgentConfig.Systemd,
 		IsRunningInUserNS:     isRunningInUserNS,
 		EnableUnprivileged:    kernel.CheckKernelVersion(4, 11, 0),
+		NonrootDevices:        cfg.Containerd.NonrootDevices,
 		PrivateRegistryConfig: cfg.AgentConfig.Registry,
 		ExtraRuntimes:         extraRuntimes,
 		Program:               version.Program,

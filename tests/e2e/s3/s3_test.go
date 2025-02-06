@@ -6,16 +6,18 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/k3s-io/k3s/tests"
 	"github.com/k3s-io/k3s/tests/e2e"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 // Valid nodeOS:
-// generic/ubuntu2004, generic/centos7, generic/rocky8,
-// opensuse/Leap-15.3.x86_64
-var nodeOS = flag.String("nodeOS", "generic/ubuntu2004", "VM operating system")
+// bento/ubuntu-24.04, opensuse/Leap-15.6.x86_64
+// eurolinux-vagrant/rocky-8, eurolinux-vagrant/rocky-9,
+var nodeOS = flag.String("nodeOS", "bento/ubuntu-24.04", "VM operating system")
 var ci = flag.Bool("ci", false, "running on CI")
 var local = flag.Bool("local", false, "deploy a locally built K3s binary")
 
@@ -30,11 +32,7 @@ func Test_E2ES3(t *testing.T) {
 	RunSpecs(t, "Create Cluster Test Suite", suiteConfig, reporterConfig)
 }
 
-var (
-	kubeConfigFile  string
-	serverNodeNames []string
-	agentNodeNames  []string
-)
+var tc *e2e.TestConfig
 
 var _ = ReportAfterEach(e2e.GenReport)
 
@@ -43,104 +41,114 @@ var _ = Describe("Verify Create", Ordered, func() {
 		It("Starts up with no issues", func() {
 			var err error
 			if *local {
-				serverNodeNames, agentNodeNames, err = e2e.CreateLocalCluster(*nodeOS, 1, 0)
+				tc, err = e2e.CreateLocalCluster(*nodeOS, 1, 0)
 			} else {
-				serverNodeNames, agentNodeNames, err = e2e.CreateCluster(*nodeOS, 1, 0)
+				tc, err = e2e.CreateCluster(*nodeOS, 1, 0)
 			}
 			Expect(err).NotTo(HaveOccurred(), e2e.GetVagrantLog(err))
-			fmt.Println("CLUSTER CONFIG")
-			fmt.Println("OS:", *nodeOS)
-			fmt.Println("Server Nodes:", serverNodeNames)
-			fmt.Println("Agent Nodes:", agentNodeNames)
-			kubeConfigFile, err = e2e.GenKubeConfigFile(serverNodeNames[0])
-			Expect(err).NotTo(HaveOccurred())
+			By("CLUSTER CONFIG")
+			By("OS: " + *nodeOS)
+			By(tc.Status())
 		})
-		It("Checks Node and Pod Status", func() {
-			fmt.Printf("\nFetching node status\n")
+		It("Checks node and pod status", func() {
+			By("Fetching Nodes status")
 			Eventually(func(g Gomega) {
-				nodes, err := e2e.ParseNodes(kubeConfigFile, false)
+				nodes, err := e2e.ParseNodes(tc.KubeConfigFile, false)
 				g.Expect(err).NotTo(HaveOccurred())
 				for _, node := range nodes {
 					g.Expect(node.Status).Should(Equal("Ready"))
 				}
 			}, "620s", "5s").Should(Succeed())
-			_, _ = e2e.ParseNodes(kubeConfigFile, true)
+			e2e.ParseNodes(tc.KubeConfigFile, true)
 
-			fmt.Printf("\nFetching Pods status\n")
-			Eventually(func(g Gomega) {
-				pods, err := e2e.ParsePods(kubeConfigFile, false)
-				g.Expect(err).NotTo(HaveOccurred())
-				for _, pod := range pods {
-					if strings.Contains(pod.Name, "helm-install") {
-						g.Expect(pod.Status).Should(Equal("Completed"), pod.Name)
-					} else {
-						g.Expect(pod.Status).Should(Equal("Running"), pod.Name)
-					}
-				}
+			Eventually(func() error {
+				return tests.AllPodsUp(tc.KubeConfigFile)
 			}, "620s", "5s").Should(Succeed())
-			_, _ = e2e.ParsePods(kubeConfigFile, true)
+			e2e.DumpPods(tc.KubeConfigFile)
 		})
 
 		It("ensures s3 mock is working", func() {
-			res, err := e2e.RunCmdOnNode("docker ps -a | grep mock\n", serverNodeNames[0])
+			res, err := tc.Servers[0].RunCmdOnNode("docker ps -a | grep mock\n")
 			fmt.Println(res)
 			Expect(err).NotTo(HaveOccurred())
 		})
-		It("save s3 snapshot", func() {
-			res, err := e2e.RunCmdOnNode("k3s etcd-snapshot save", serverNodeNames[0])
+		It("save s3 snapshot using CLI", func() {
+			res, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot save " +
+				"--etcd-s3-insecure=true " +
+				"--etcd-s3-bucket=test-bucket " +
+				"--etcd-s3-folder=test-folder " +
+				"--etcd-s3-endpoint=localhost:9090 " +
+				"--etcd-s3-skip-ssl-verify=true " +
+				"--etcd-s3-access-key=test ")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(res).To(ContainSubstring("S3 bucket test exists"))
-			Expect(res).To(ContainSubstring("Uploading snapshot"))
-			Expect(res).To(ContainSubstring("S3 upload complete for"))
+			Expect(res).To(ContainSubstring("Snapshot on-demand-server-0"))
+		})
+		It("creates s3 config secret", func() {
+			res, err := tc.Servers[0].RunCmdOnNode("k3s kubectl create secret generic k3s-etcd-s3-config --namespace=kube-system " +
+				"--from-literal=etcd-s3-insecure=true " +
+				"--from-literal=etcd-s3-bucket=test-bucket " +
+				"--from-literal=etcd-s3-folder=test-folder " +
+				"--from-literal=etcd-s3-endpoint=localhost:9090 " +
+				"--from-literal=etcd-s3-skip-ssl-verify=true " +
+				"--from-literal=etcd-s3-access-key=test ")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res).To(ContainSubstring("secret/k3s-etcd-s3-config created"))
+		})
+		It("save s3 snapshot using secret", func() {
+			res, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot save")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res).To(ContainSubstring("Snapshot on-demand-server-0"))
 		})
 		It("lists saved s3 snapshot", func() {
-			res, err := e2e.RunCmdOnNode("k3s etcd-snapshot list", serverNodeNames[0])
+			res, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot list")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(res).To(ContainSubstring("on-demand-server-0"))
+			Expect(res).To(ContainSubstring("file:///var/lib/rancher/k3s/server/db/snapshots/on-demand-server-0"))
+			Expect(res).To(ContainSubstring("s3://test-bucket/test-folder/on-demand-server-0"))
 		})
 		It("save 3 more s3 snapshots", func() {
 			for _, i := range []string{"1", "2", "3"} {
-				res, err := e2e.RunCmdOnNode("k3s etcd-snapshot save --name special-"+i, serverNodeNames[0])
+				res, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot save --name special-" + i)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(res).To(ContainSubstring("Uploading snapshot"))
-				Expect(res).To(ContainSubstring("S3 upload complete for special-" + i))
+				Expect(res).To(ContainSubstring("Snapshot special-" + i + "-server-0"))
 			}
 		})
 		It("lists saved s3 snapshot", func() {
-			res, err := e2e.RunCmdOnNode("k3s etcd-snapshot list", serverNodeNames[0])
+			res, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot list")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(res).To(ContainSubstring("on-demand-server-0"))
-			Expect(res).To(ContainSubstring("special-1-server-0"))
-			Expect(res).To(ContainSubstring("special-2-server-0"))
-			Expect(res).To(ContainSubstring("special-3-server-0"))
+			Expect(res).To(ContainSubstring("s3://test-bucket/test-folder/on-demand-server-0"))
+			Expect(res).To(ContainSubstring("s3://test-bucket/test-folder/special-1-server-0"))
+			Expect(res).To(ContainSubstring("s3://test-bucket/test-folder/special-2-server-0"))
+			Expect(res).To(ContainSubstring("s3://test-bucket/test-folder/special-3-server-0"))
 		})
 		It("delete first on-demand s3 snapshot", func() {
-			_, err := e2e.RunCmdOnNode("sudo k3s etcd-snapshot ls >> ./snapshotname.txt", serverNodeNames[0])
+			_, err := tc.Servers[0].RunCmdOnNode("sudo k3s etcd-snapshot ls >> ./snapshotname.txt")
 			Expect(err).NotTo(HaveOccurred())
-			snapshotName, err := e2e.RunCmdOnNode("grep -Eo 'on-demand-server-0-([0-9]+)' ./snapshotname.txt |head -1", serverNodeNames[0])
+			snapshotName, err := tc.Servers[0].RunCmdOnNode("grep -Eo 'on-demand-server-0-([0-9]+)' ./snapshotname.txt | head -1")
 			Expect(err).NotTo(HaveOccurred())
-			res, err := e2e.RunCmdOnNode("sudo k3s etcd-snapshot delete "+snapshotName, serverNodeNames[0])
+			res, err := tc.Servers[0].RunCmdOnNode("sudo k3s etcd-snapshot delete " + snapshotName)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(res).To(ContainSubstring("Reconciling ETCDSnapshotFile resources"))
-			Expect(res).To(ContainSubstring("Snapshot " + strings.TrimSpace(snapshotName) + " deleted from S3"))
-			Expect(res).To(ContainSubstring("Reconciliation of ETCDSnapshotFile resources complete"))
+			Expect(res).To(ContainSubstring("Snapshot " + strings.TrimSpace(snapshotName) + " deleted"))
 		})
-
-		// TODO, there is currently a bug that prevents pruning on s3 snapshots that are not prefixed with "on-demand"
-		// https://github.com/rancher/rke2/issues/3714
-		// Once fixed, ensure that the snapshots list are actually reduced to 2
 		It("prunes s3 snapshots", func() {
-			res, err := e2e.RunCmdOnNode("k3s etcd-snapshot save", serverNodeNames[0])
+			_, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot save")
 			Expect(err).NotTo(HaveOccurred())
-			res, err = e2e.RunCmdOnNode("k3s etcd-snapshot save", serverNodeNames[0])
+			time.Sleep(time.Second)
+			_, err = tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot save")
 			Expect(err).NotTo(HaveOccurred())
-			_, err = e2e.RunCmdOnNode("k3s etcd-snapshot prune --snapshot-retention 2", serverNodeNames[0])
-			res, err = e2e.RunCmdOnNode("sudo k3s etcd-snapshot prune --snapshot-retention 2", serverNodeNames[0])
+			time.Sleep(time.Second)
+			res, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot prune")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(res).To(ContainSubstring("Reconciliation of ETCDSnapshotFile resources complete"))
-
-			_, err = e2e.RunCmdOnNode("k3s etcd-snapshot ls|grep 'on-demand'|wc -l>count", serverNodeNames[0])
-			res, err = e2e.RunCmdOnNode("grep '^[4]$' ./count", serverNodeNames[0])
+			// There should now be 4 on-demand snapshots - 2 local, and 2 on s3
+			res, err = tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot ls 2>/dev/null | grep on-demand | wc -l")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(res)).To(Equal("4"))
+		})
+		It("ensure snapshots retention is working in s3 and local", func() {
+			// Wait until the retention works with 3 minutes
+			fmt.Printf("\nWaiting 3 minutes until retention works\n")
+			time.Sleep(3 * time.Minute)
+			res, err := tc.Servers[0].RunCmdOnNode("k3s etcd-snapshot ls 2>/dev/null | grep etcd-snapshot | wc -l")
+			Expect(err).NotTo(HaveOccurred())
 			Expect(strings.TrimSpace(res)).To(Equal("4"))
 		})
 	})
@@ -152,12 +160,13 @@ var _ = AfterEach(func() {
 })
 
 var _ = AfterSuite(func() {
-
-	if failed && !*ci {
-		fmt.Println("FAILED!")
+	if failed {
+		Expect(e2e.SaveJournalLogs(append(tc.Servers, tc.Agents...))).To(Succeed())
 	} else {
-		Expect(e2e.GetCoverageReport(append(serverNodeNames, agentNodeNames...))).To(Succeed())
+		Expect(e2e.GetCoverageReport(append(tc.Servers, tc.Agents...))).To(Succeed())
+	}
+	if !failed || *ci {
 		Expect(e2e.DestroyCluster()).To(Succeed())
-		Expect(os.Remove(kubeConfigFile)).To(Succeed())
+		Expect(os.Remove(tc.KubeConfigFile)).To(Succeed())
 	}
 })

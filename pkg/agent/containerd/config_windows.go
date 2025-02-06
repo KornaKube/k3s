@@ -4,15 +4,13 @@
 package containerd
 
 import (
-	"context"
-
 	"github.com/containerd/containerd"
 	"github.com/k3s-io/k3s/pkg/agent/templates"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	util3 "github.com/k3s-io/k3s/pkg/util"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"k8s.io/kubernetes/pkg/kubelet/util"
+	"k8s.io/cri-client/pkg/util"
 )
 
 func getContainerdArgs(cfg *config.Node) []string {
@@ -23,9 +21,9 @@ func getContainerdArgs(cfg *config.Node) []string {
 	return args
 }
 
-// setupContainerdConfig generates the containerd.toml, using a template combined with various
+// SetupContainerdConfig generates the containerd.toml, using a template combined with various
 // runtime configurations and registry mirror settings provided by the administrator.
-func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
+func SetupContainerdConfig(cfg *config.Node) error {
 	if cfg.SELinux {
 		logrus.Warn("SELinux isn't supported on windows")
 	}
@@ -33,8 +31,6 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 	containerdConfig := templates.ContainerdConfig{
 		NodeConfig:            cfg,
 		DisableCgroup:         true,
-		SystemdCgroup:         false,
-		IsRunningInUserNS:     false,
 		PrivateRegistryConfig: cfg.AgentConfig.Registry,
 		NoDefaultEndpoint:     cfg.Containerd.NoDefault,
 	}
